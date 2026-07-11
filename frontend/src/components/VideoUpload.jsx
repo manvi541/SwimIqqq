@@ -3,20 +3,27 @@ import SkeletonOverlay from './SkeletonOverlay'
 import ScorePanel from './ScorePanel'
 import TipsPanel from './TipsPanel'
 import { initMoveNet, detectPose } from '../utils/movenet'
-import { analyzeFrame, generateTips } from '../utils/analysis'
+import { StrokeAnalyzer } from '../utils/swimmingAnalysis'
 import { computeScore } from '../utils/scoring'
-import { Upload, Loader2, Play, RotateCcw, Waves } from 'lucide-react'
+import { generateTips } from '../utils/tips'
+import { analyzeStrokeWithGemini } from '../utils/gemini'
+import { useAudioFeedback } from '../hooks/useAudioFeedback'
+import { Upload, Loader2, Play, RotateCcw, Volume2, VolumeX, Waves } from 'lucide-react'
 
 export default function VideoUpload() {
   const videoRef = useRef(null)
-  const canvasRef = useRef(null)
   const [videoSrc, setVideoSrc] = useState(null)
   const [isProcessing, setIsProcessing] = useState(false)
   const [isProcessed, setIsProcessed] = useState(false)
   const [currentPose, setCurrentPose] = useState(null)
   const [finalScore, setFinalScore] = useState(null)
+  const [snapshot, setSnapshot] = useState(null)
   const [tips, setTips] = useState([])
   const [progress, setProgress] = useState(0)
+  const [statusText, setStatusText] = useState('')
+  const lastPoseRef = useRef(null)
+  const { isEnabled: audioEnabled, setIsEnabled: setAudioEnabled, speakTips } =
+    useAudioFeedback()
 
   const handleUpload = useCallback((e) => {
     const file = e.target.files?.[0]
@@ -25,6 +32,7 @@ export default function VideoUpload() {
     setVideoSrc(url)
     setIsProcessed(false)
     setFinalScore(null)
+    setSnapshot(null)
     setTips([])
     setCurrentPose(null)
   }, [])
@@ -36,72 +44,85 @@ export default function VideoUpload() {
 
     const video = videoRef.current
     await video.play()
+    video.pause()
+
+    const duration = Math.min(video.duration, 60)
+
+    setStatusText('Identifying stroke type with AI...')
+    setProgress(10)
+    let geminiResult = null
+    try {
+      geminiResult = await analyzeStrokeWithGemini(video, duration)
+    } catch (e) {
+      console.warn('Gemini analysis failed, using pose detection fallback:', e)
+    }
+
+    setStatusText('Analyzing pose and form...')
+    setProgress(30)
 
     const detector = await initMoveNet()
-    const analyses = []
-    const duration = video.duration
-    const sampleInterval = 0.2
+    const analyzer = new StrokeAnalyzer()
+    const sampleInterval = 0.5
 
     let currentTime = 0
     while (currentTime < duration) {
       video.currentTime = currentTime
-      await new Promise((r) => {
-        video.onseeked = r
-      })
+      await new Promise((r) => { video.onseeked = r })
 
       const pose = await detectPose(video)
       if (pose) {
-        const frameAnalysis = analyzeFrame(pose)
-        analyses.push(frameAnalysis)
+        const snap = analyzer.processFrame(pose)
+        lastPoseRef.current = pose
         setCurrentPose(pose)
+        setSnapshot(snap)
       }
 
-      setProgress(Math.min(100, (currentTime / duration) * 100))
+      setProgress(30 + Math.min(65, (currentTime / duration) * 65))
       currentTime += sampleInterval
     }
 
-    if (analyses.length > 0) {
-      const avgSymmetry = analyses
-        .filter(a => a.symmetry)
-        .reduce((s, a, _, arr) => s + a.symmetry.symmetryPct / arr.length, 0) || 70
+    setStatusText('Scoring...')
+    setProgress(95)
 
-      const avgAlignment = analyses
-        .filter(a => a.alignment)
-        .reduce((s, a, _, arr) => s + a.alignment.alignmentScore / arr.length, 0) || 70
+    const finalSnap = analyzer.getSnapshot(lastPoseRef.current)
 
-      const avgLeft = analyses
-        .filter(a => a.leftArm)
-        .reduce((s, a, _, arr) => s + a.leftArm.extensionPct / arr.length, 0) || 50
+    if (geminiResult && geminiResult.stroke && geminiResult.stroke !== 'Detecting...') {
+      finalSnap.strokeType = geminiResult.stroke
+      finalSnap.strokeConfidence = geminiResult.confidence || 85
+    }
 
-      const avgRight = analyses
-        .filter(a => a.rightArm)
-        .reduce((s, a, _, arr) => s + a.rightArm.extensionPct / arr.length, 0) || 50
+    const score = computeScore(finalSnap)
+    const newTips = generateTips(finalSnap)
 
-      const score = computeScore({
-        symmetry: { symmetryPct: avgSymmetry },
-        alignment: { alignmentScore: avgAlignment },
-        leftArm: { extensionPct: avgLeft },
-        rightArm: { extensionPct: avgRight },
-      })
-      setFinalScore(score)
+    if (geminiResult && geminiResult.feedback) {
+      newTips.unshift({ type: 'info', text: geminiResult.feedback })
+    }
 
-      const lastAnalysis = analyses[analyses.length - 1]
-      setTips(generateTips(lastAnalysis))
+    setFinalScore(score)
+    setSnapshot(finalSnap)
+    setTips(newTips.slice(0, 4))
+
+    if (audioEnabled && newTips.length > 0) {
+      speakTips(newTips)
     }
 
     video.pause()
     setIsProcessing(false)
     setIsProcessed(true)
     setProgress(100)
-  }, [])
+    setStatusText('')
+  }, [audioEnabled, speakTips])
 
   const reset = useCallback(() => {
     setVideoSrc(null)
     setIsProcessed(false)
     setFinalScore(null)
+    setSnapshot(null)
     setTips([])
     setCurrentPose(null)
     setProgress(0)
+    setStatusText('')
+    lastPoseRef.current = null
     if (videoRef.current) {
       videoRef.current.pause()
       videoRef.current.currentTime = 0
@@ -111,12 +132,21 @@ export default function VideoUpload() {
   return (
     <div className="min-h-screen bg-gradient-to-b from-slate-950 via-slate-900 to-slate-950">
       <div className="max-w-6xl mx-auto px-4 py-6">
-        <header className="flex items-center gap-3 mb-6">
-          <Waves className="w-8 h-8 text-cyan-400" />
-          <h1 className="text-2xl font-bold bg-gradient-to-r from-cyan-400 to-blue-400 bg-clip-text text-transparent">
-            SwimIQ
-          </h1>
-          <span className="text-slate-500 text-sm ml-2">Video Analysis</span>
+        <header className="flex items-center justify-between mb-6">
+          <div className="flex items-center gap-3">
+            <Waves className="w-8 h-8 text-cyan-400" />
+            <h1 className="text-2xl font-bold bg-gradient-to-r from-cyan-400 to-blue-400 bg-clip-text text-transparent">
+              SwimIQ
+            </h1>
+            <span className="text-slate-500 text-sm ml-2">Video Analysis</span>
+          </div>
+          <button
+            onClick={() => setAudioEnabled(!audioEnabled)}
+            className="p-2 rounded-lg bg-slate-800 hover:bg-slate-700 transition-colors"
+            title={audioEnabled ? 'Mute feedback' : 'Enable audio feedback'}
+          >
+            {audioEnabled ? <Volume2 className="w-5 h-5 text-cyan-400" /> : <VolumeX className="w-5 h-5 text-slate-500" />}
+          </button>
         </header>
 
         <div className="grid grid-cols-1 lg:grid-cols-3 gap-6">
@@ -163,7 +193,7 @@ export default function VideoUpload() {
                   <div className="flex items-center gap-3 mb-2">
                     <Loader2 className="w-5 h-5 text-cyan-400 animate-spin" />
                     <span className="text-sm text-slate-300">
-                      Analyzing... {Math.round(progress)}%
+                      {statusText} {Math.round(progress)}%
                     </span>
                   </div>
                   <div className="h-1.5 bg-slate-800 rounded-full overflow-hidden">
@@ -172,6 +202,17 @@ export default function VideoUpload() {
                       style={{ width: `${progress}%` }}
                     />
                   </div>
+                </div>
+              )}
+
+              {snapshot && snapshot.phases && isProcessing && (
+                <div className="absolute top-4 right-4 bg-slate-900/80 backdrop-blur-sm rounded-lg px-3 py-2 text-xs text-slate-300 flex gap-4">
+                  <span>
+                    L: <span className="text-cyan-400 font-semibold">{snapshot.phases.left}</span>
+                  </span>
+                  <span>
+                    R: <span className="text-cyan-400 font-semibold">{snapshot.phases.right}</span>
+                  </span>
                 </div>
               )}
             </div>
@@ -199,7 +240,7 @@ export default function VideoUpload() {
           </div>
 
           <div className="space-y-4">
-            <ScorePanel score={finalScore} />
+            <ScorePanel score={finalScore} snapshot={snapshot} />
             <TipsPanel tips={tips} />
           </div>
         </div>

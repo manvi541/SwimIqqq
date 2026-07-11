@@ -29,25 +29,71 @@ const PHASE = {
   UNKNOWN: 'unknown',
 }
 
+const STROKE = {
+  FREESTYLE: 'Freestyle',
+  BACKSTROKE: 'Backstroke',
+  BREASTSTROKE: 'Breaststroke',
+  BUTTERFLY: 'Butterfly',
+  UNKNOWN: 'Detecting...',
+}
+
+function correlation(arrA, arrB) {
+  const n = Math.min(arrA.length, arrB.length)
+  if (n < 5) return 0
+  const a = arrA.slice(-n)
+  const b = arrB.slice(-n)
+  const meanA = a.reduce((s, v) => s + v, 0) / n
+  const meanB = b.reduce((s, v) => s + v, 0) / n
+  let num = 0, denA = 0, denB = 0
+  for (let i = 0; i < n; i++) {
+    const da = a[i] - meanA
+    const db = b[i] - meanB
+    num += da * db
+    denA += da * da
+    denB += db * db
+  }
+  const den = Math.sqrt(denA * denB)
+  return den === 0 ? 0 : num / den
+}
+
+function stddev(arr) {
+  if (arr.length < 2) return 0
+  const mean = arr.reduce((s, v) => s + v, 0) / arr.length
+  const variance = arr.reduce((s, v) => s + (v - mean) ** 2, 0) / arr.length
+  return Math.sqrt(variance)
+}
+
 export class StrokeAnalyzer {
   constructor() {
     this.wristHistory = { left: [], right: [] }
+    this.shoulderHistory = []
+    this.hipHistory = []
+    this.headHistory = []
     this.strokes = []
     this.currentPhase = { left: PHASE.UNKNOWN, right: PHASE.UNKNOWN }
     this.prevWristY = { left: null, right: null }
     this.lastStrokeTime = { left: null, right: null }
     this.allArmExtensions = { left: [], right: [] }
     this.frameCount = 0
+    this.frameStrokeRecorded = false
+    this.detectedStroke = STROKE.UNKNOWN
+    this.strokeConfidence = 0
   }
 
   reset() {
     this.wristHistory = { left: [], right: [] }
+    this.shoulderHistory = []
+    this.hipHistory = []
+    this.headHistory = []
     this.strokes = []
     this.currentPhase = { left: PHASE.UNKNOWN, right: PHASE.UNKNOWN }
     this.prevWristY = { left: null, right: null }
     this.lastStrokeTime = { left: null, right: null }
     this.allArmExtensions = { left: [], right: [] }
     this.frameCount = 0
+    this.frameStrokeRecorded = false
+    this.detectedStroke = STROKE.UNKNOWN
+    this.strokeConfidence = 0
   }
 
   processFrame(pose) {
@@ -57,14 +103,39 @@ export class StrokeAnalyzer {
 
     const leftWrist = getKp(pose, 'leftWrist')
     const rightWrist = getKp(pose, 'rightWrist')
+    const leftShoulder = getKp(pose, 'leftShoulder')
+    const rightShoulder = getKp(pose, 'rightShoulder')
+    const leftHip = getKp(pose, 'leftHip')
+    const rightHip = getKp(pose, 'rightHip')
+    const nose = getKp(pose, 'nose')
 
     if (hasScore(leftWrist)) {
-      this.wristHistory.left.push({ y: leftWrist.y, t: now })
-      if (this.wristHistory.left.length > 60) this.wristHistory.left.shift()
+      this.wristHistory.left.push({ y: leftWrist.y, x: leftWrist.x, t: now })
+      if (this.wristHistory.left.length > 90) this.wristHistory.left.shift()
     }
     if (hasScore(rightWrist)) {
-      this.wristHistory.right.push({ y: rightWrist.y, t: now })
-      if (this.wristHistory.right.length > 60) this.wristHistory.right.shift()
+      this.wristHistory.right.push({ y: rightWrist.y, x: rightWrist.x, t: now })
+      if (this.wristHistory.right.length > 90) this.wristHistory.right.shift()
+    }
+    if (hasScore(leftShoulder, rightShoulder)) {
+      this.shoulderHistory.push({
+        leftY: leftShoulder.y,
+        rightY: rightShoulder.y,
+        leftX: leftShoulder.x,
+        rightX: rightShoulder.x,
+        t: now,
+      })
+      if (this.shoulderHistory.length > 90) this.shoulderHistory.shift()
+    }
+    if (hasScore(leftHip, rightHip)) {
+      const hipMidY = (leftHip.y + rightHip.y) / 2
+      this.hipHistory.push({ y: hipMidY, t: now })
+      if (this.hipHistory.length > 90) this.hipHistory.shift()
+    }
+    if (hasScore(nose, leftShoulder, rightShoulder)) {
+      const shoulderMidY = (leftShoulder.y + rightShoulder.y) / 2
+      this.headHistory.push({ noseY: nose.y, shoulderMidY, t: now })
+      if (this.headHistory.length > 90) this.headHistory.shift()
     }
 
     this.detectPhase('left', leftWrist, now)
@@ -75,7 +146,65 @@ export class StrokeAnalyzer {
     if (leftArmExt !== null) this.allArmExtensions.left.push(leftArmExt)
     if (rightArmExt !== null) this.allArmExtensions.right.push(rightArmExt)
 
+    this.detectStrokeType()
+
     return this.getSnapshot(pose)
+  }
+
+  detectStrokeType() {
+    if (this.frameCount < 20) {
+      this.detectedStroke = STROKE.UNKNOWN
+      this.strokeConfidence = 0
+      return
+    }
+
+    const leftYs = this.wristHistory.left.map(h => h.y)
+    const rightYs = this.wristHistory.right.map(h => h.y)
+    const shoulderDiffs = this.shoulderHistory.map(h => Math.abs(h.leftY - h.rightY))
+    const hipYs = this.hipHistory.map(h => h.y)
+
+    const corr = correlation(leftYs, rightYs)
+    const shoulderRoll = stddev(shoulderDiffs)
+    const hipUndulation = stddev(hipYs)
+
+    const noseAboveShoulders = this.headHistory.length > 10
+      ? this.headHistory.slice(-10).filter(h => h.noseY < h.shoulderMidY).length > 5
+      : null
+
+    const wristRange = Math.max(
+      stddev(leftYs) + stddev(rightYs),
+      1
+    )
+    const normalizedShoulderRoll = shoulderRoll / wristRange
+    const normalizedHipUndulation = hipUndulation / wristRange
+
+    let stroke = STROKE.UNKNOWN
+    let confidence = 0
+
+    if (corr < -0.3) {
+      if (noseAboveShoulders === true) {
+        stroke = STROKE.BACKSTROKE
+        confidence = Math.min(100, Math.round(Math.abs(corr) * 80 + normalizedShoulderRoll * 30))
+      } else {
+        stroke = STROKE.FREESTYLE
+        confidence = Math.min(100, Math.round(Math.abs(corr) * 80 + normalizedShoulderRoll * 20))
+      }
+    } else if (corr > 0.3) {
+      if (normalizedHipUndulation > 0.4) {
+        stroke = STROKE.BUTTERFLY
+        confidence = Math.min(100, Math.round(corr * 60 + normalizedHipUndulation * 50))
+      } else {
+        stroke = STROKE.BREASTSTROKE
+        confidence = Math.min(100, Math.round(corr * 60 + (1 - normalizedHipUndulation) * 40))
+      }
+    } else {
+      confidence = Math.max(0, 30 - Math.abs(corr) * 50)
+    }
+
+    if (confidence > this.strokeConfidence || stroke !== STROKE.UNKNOWN) {
+      this.detectedStroke = stroke
+      this.strokeConfidence = confidence
+    }
   }
 
   detectPhase(side, wrist, now) {
@@ -84,7 +213,6 @@ export class StrokeAnalyzer {
     const history = this.wristHistory[side]
     if (history.length < 5) return
 
-    // Smooth the Y position using last 5 frames
     const recent = history.slice(-5)
     const avgY = recent.reduce((s, h) => s + h.y, 0) / recent.length
 
@@ -93,14 +221,8 @@ export class StrokeAnalyzer {
 
     if (prevAvgY === null) return
 
-    const yVelocity = avgY - prevAvgY // positive = moving down in frame = moving up physically
-
+    const yVelocity = avgY - prevAvgY
     const prevPhase = this.currentPhase[side]
-
-    // Detection logic:
-    // RECOVERY → wrist moves UP in frame (y decreases, negative velocity) = hand exiting water going forward
-    // ENTRY → wrist at highest point (y minimal), velocity transitions from negative to positive
-    // PULL → wrist moves DOWN in frame (y increases, positive velocity) = hand pulling back
 
     if (prevPhase === PHASE.RECOVERY || prevPhase === PHASE.UNKNOWN) {
       if (yVelocity > 0.5 && avgY > (prevAvgY + 1)) {
@@ -129,10 +251,6 @@ export class StrokeAnalyzer {
     }
   }
 
-  getAllKeypoints() {
-    return []
-  }
-
   computeArmExtension(pose, side) {
     const shoulder = getKp(pose, `${side}Shoulder`)
     const elbow = getKp(pose, `${side}Elbow`)
@@ -158,7 +276,6 @@ export class StrokeAnalyzer {
   getSnapshot(pose) {
     const recentStrokes = this.strokes.slice(-10)
 
-    // Stroke rate (strokes per minute)
     let strokeRate = 0
     if (recentStrokes.length >= 2) {
       const timeSpan = (recentStrokes[recentStrokes.length - 1].time - recentStrokes[0].time) / 1000
@@ -167,7 +284,6 @@ export class StrokeAnalyzer {
       }
     }
 
-    // Stroke consistency (coefficient of variation of durations, lower = more consistent)
     let consistency = 100
     if (recentStrokes.length >= 3) {
       const durations = recentStrokes.map(s => s.duration)
@@ -177,7 +293,6 @@ export class StrokeAnalyzer {
       consistency = Math.max(0, Math.round(100 - cv * 200))
     }
 
-    // Per-stroke symmetry (compare last left and right strokes)
     let symmetry = 50
     const leftStrokes = recentStrokes.filter(s => s.side === 'left')
     const rightStrokes = recentStrokes.filter(s => s.side === 'right')
@@ -185,12 +300,10 @@ export class StrokeAnalyzer {
     if (leftStrokes.length > 0 && rightStrokes.length > 0) {
       const lastLeft = leftStrokes[leftStrokes.length - 1]
       const lastRight = rightStrokes[rightStrokes.length - 1]
-
       const ratio = Math.min(lastLeft.duration, lastRight.duration) / Math.max(lastLeft.duration, lastRight.duration)
       symmetry = Math.round(ratio * 100)
     }
 
-    // Average arm extensions
     const avgLeftExt = this.allArmExtensions.left.length > 0
       ? Math.round(this.allArmExtensions.left.slice(-20).reduce((a, b) => a + b, 0) / Math.min(20, this.allArmExtensions.left.length))
       : 50
@@ -198,7 +311,7 @@ export class StrokeAnalyzer {
       ? Math.round(this.allArmExtensions.right.slice(-20).reduce((a, b) => a + b, 0) / Math.min(20, this.allArmExtensions.right.length))
       : 50
 
-    const headAlignment = this.getHeadAlignment(pose)
+    const headAlignment = pose ? this.getHeadAlignment(pose) : null
 
     return {
       strokeCount: recentStrokes.length,
@@ -210,6 +323,10 @@ export class StrokeAnalyzer {
       headAlignment,
       phases: { ...this.currentPhase },
       recentStrokes: recentStrokes.slice(-6),
+      strokeType: this.detectedStroke,
+      strokeConfidence: this.strokeConfidence,
     }
   }
 }
+
+export { STROKE }

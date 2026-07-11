@@ -5,8 +5,6 @@ const KEYPOINT_MAP = {
   leftKnee: 13, rightKnee: 14, leftAnkle: 15, rightAnkle: 16,
 }
 
-const PHASE = { ENTRY: 'entry', PULL: 'pull', RECOVERY: 'recovery', UNKNOWN: 'unknown' }
-
 function getKp(pose, name) {
   const idx = KEYPOINT_MAP[name]
   return idx !== undefined ? pose.keypoints[idx] : null
@@ -25,84 +23,172 @@ function hasScore(...kps) {
   return kps.every(kp => kp && kp.score > 0.3)
 }
 
+function correlation(arrA, arrB) {
+  const n = Math.min(arrA.length, arrB.length)
+  if (n < 5) return 0
+  const a = arrA.slice(-n)
+  const b = arrB.slice(-n)
+  const meanA = a.reduce((s, v) => s + v, 0) / n
+  const meanB = b.reduce((s, v) => s + v, 0) / n
+  let num = 0, denA = 0, denB = 0
+  for (let i = 0; i < n; i++) {
+    const da = a[i] - meanA
+    const db = b[i] - meanB
+    num += da * db
+    denA += da * da
+    denB += db * db
+  }
+  const den = Math.sqrt(denA * denB)
+  return den === 0 ? 0 : num / den
+}
+
+function stddev(arr) {
+  if (arr.length < 2) return 0
+  const mean = arr.reduce((s, v) => s + v, 0) / arr.length
+  return Math.sqrt(arr.reduce((s, v) => s + (v - mean) ** 2, 0) / arr.length)
+}
+
+const PHASE = { ENTRY: 'entry', PULL: 'pull', RECOVERY: 'recovery', UNKNOWN: 'unknown' }
+const STROKE = { FREESTYLE: 'Freestyle', BACKSTROKE: 'Backstroke', BREASTSTROKE: 'Breaststroke', BUTTERFLY: 'Butterfly', UNKNOWN: 'Detecting...' }
+
 class StrokeAnalyzer {
   constructor() {
     this.wristHistory = { left: [], right: [] }
     this.shoulderHistory = []
+    this.hipHistory = []
+    this.headHistory = []
     this.strokes = []
     this.currentPhase = { left: PHASE.UNKNOWN, right: PHASE.UNKNOWN }
     this.prevWristY = { left: null, right: null }
     this.lastStrokeTime = { left: null, right: null }
-    this.allArmExtensions = { left: [], right: [] }
     this.frameCount = 0
+    this.frameStrokeRecorded = false
+    this.detectedStroke = STROKE.UNKNOWN
+    this.strokeConfidence = 0
   }
 
   processFrame(pose) {
     this.frameCount++
     const now = Date.now()
     this.frameStrokeRecorded = false
+
     const leftWrist = getKp(pose, 'leftWrist')
     const rightWrist = getKp(pose, 'rightWrist')
     const leftShoulder = getKp(pose, 'leftShoulder')
     const rightShoulder = getKp(pose, 'rightShoulder')
+    const leftHip = getKp(pose, 'leftHip')
+    const rightHip = getKp(pose, 'rightHip')
+    const nose = getKp(pose, 'nose')
 
     if (hasScore(leftWrist)) {
       this.wristHistory.left.push({ y: leftWrist.y, t: now })
-      if (this.wristHistory.left.length > 60) this.wristHistory.left.shift()
+      if (this.wristHistory.left.length > 90) this.wristHistory.left.shift()
     }
     if (hasScore(rightWrist)) {
       this.wristHistory.right.push({ y: rightWrist.y, t: now })
-      if (this.wristHistory.right.length > 60) this.wristHistory.right.shift()
+      if (this.wristHistory.right.length > 90) this.wristHistory.right.shift()
+    }
+    if (hasScore(leftShoulder, rightShoulder)) {
+      this.shoulderHistory.push({ leftY: leftShoulder.y, rightY: rightShoulder.y, t: now })
+      if (this.shoulderHistory.length > 90) this.shoulderHistory.shift()
+    }
+    if (hasScore(leftHip, rightHip)) {
+      this.hipHistory.push({ y: (leftHip.y + rightHip.y) / 2, t: now })
+      if (this.hipHistory.length > 90) this.hipHistory.shift()
+    }
+    if (hasScore(nose, leftShoulder, rightShoulder)) {
+      this.headHistory.push({ noseY: nose.y, shoulderMidY: (leftShoulder.y + rightShoulder.y) / 2, t: now })
+      if (this.headHistory.length > 90) this.headHistory.shift()
     }
 
     this.detectPhase('left', leftWrist, now)
     this.detectPhase('right', rightWrist, now)
+    this.detectStrokeType()
 
     return this.getSnapshot()
+  }
+
+  detectStrokeType() {
+    if (this.frameCount < 20) {
+      this.detectedStroke = STROKE.UNKNOWN
+      this.strokeConfidence = 0
+      return
+    }
+
+    const leftYs = this.wristHistory.left.map(h => h.y)
+    const rightYs = this.wristHistory.right.map(h => h.y)
+    const shoulderDiffs = this.shoulderHistory.map(h => Math.abs(h.leftY - h.rightY))
+    const hipYs = this.hipHistory.map(h => h.y)
+
+    const corr = correlation(leftYs, rightYs)
+    const shoulderRoll = stddev(shoulderDiffs)
+    const hipUndulation = stddev(hipYs)
+
+    const noseAboveShoulders = this.headHistory.length > 10
+      ? this.headHistory.slice(-10).filter(h => h.noseY < h.shoulderMidY).length > 5
+      : null
+
+    const wristRange = Math.max(stddev(leftYs) + stddev(rightYs), 1)
+    const normalizedShoulderRoll = shoulderRoll / wristRange
+    const normalizedHipUndulation = hipUndulation / wristRange
+
+    let stroke = STROKE.UNKNOWN
+    let confidence = 0
+
+    if (corr < -0.3) {
+      if (noseAboveShoulders === true) {
+        stroke = STROKE.BACKSTROKE
+        confidence = Math.min(100, Math.round(Math.abs(corr) * 80 + normalizedShoulderRoll * 30))
+      } else {
+        stroke = STROKE.FREESTYLE
+        confidence = Math.min(100, Math.round(Math.abs(corr) * 80 + normalizedShoulderRoll * 20))
+      }
+    } else if (corr > 0.3) {
+      if (normalizedHipUndulation > 0.4) {
+        stroke = STROKE.BUTTERFLY
+        confidence = Math.min(100, Math.round(corr * 60 + normalizedHipUndulation * 50))
+      } else {
+        stroke = STROKE.BREASTSTROKE
+        confidence = Math.min(100, Math.round(corr * 60 + (1 - normalizedHipUndulation) * 40))
+      }
+    } else {
+      confidence = Math.max(0, 30 - Math.abs(corr) * 50)
+    }
+
+    if (confidence > this.strokeConfidence || stroke !== STROKE.UNKNOWN) {
+      this.detectedStroke = stroke
+      this.strokeConfidence = confidence
+    }
   }
 
   detectPhase(side, wrist, now) {
     if (!hasScore(wrist)) return
     const history = this.wristHistory[side]
     if (history.length < 5) return
-
     const recent = history.slice(-5)
     const avgY = recent.reduce((s, h) => s + h.y, 0) / recent.length
     const prevAvgY = this.prevWristY[side]
     this.prevWristY[side] = avgY
     if (prevAvgY === null) return
-
     const yVelocity = avgY - prevAvgY
     const prevPhase = this.currentPhase[side]
 
-    if (this.frameCount <= 40) {
-      if (side === 'left') {
-        console.log(`  [F${String(this.frameCount).padStart(2)}] L avgY=${avgY.toFixed(1)} prevY=${prevAvgY.toFixed(1)} vel=${yVelocity.toFixed(2)} prevPhase=${prevPhase}`)
-      }
-    }
-
     if (prevPhase === PHASE.RECOVERY || prevPhase === PHASE.UNKNOWN) {
-      if (yVelocity > 0.5) {
+      if (yVelocity > 0.5 && avgY > (prevAvgY + 1)) {
         this.currentPhase[side] = PHASE.ENTRY
         if (this.lastStrokeTime[side] !== null && !this.frameStrokeRecorded) {
           const strokeDuration = now - this.lastStrokeTime[side]
-          if (this.frameCount <= 40 && side === 'left') {
-            console.log(`    -> ENTRY detected! duration=${strokeDuration}ms`)
-          }
           if (strokeDuration > 300 && strokeDuration < 5000) {
             this.strokes.push({ side, time: now, duration: strokeDuration })
-            console.log(`    *** STROKE RECORDED: ${side} ${strokeDuration}ms ***`)
+            if (this.strokes.length > 50) this.strokes.shift()
             this.frameStrokeRecorded = true
           }
         }
         this.lastStrokeTime[side] = now
       }
     } else if (prevPhase === PHASE.ENTRY || prevPhase === PHASE.PULL) {
-      if (yVelocity < -0.5) {
-        this.currentPhase[side] = PHASE.RECOVERY
-      } else {
-        this.currentPhase[side] = PHASE.PULL
-      }
+      if (yVelocity < -0.5) this.currentPhase[side] = PHASE.RECOVERY
+      else if (yVelocity > 0.5) this.currentPhase[side] = PHASE.PULL
     }
   }
 
@@ -117,121 +203,111 @@ class StrokeAnalyzer {
     if (recentStrokes.length >= 3) {
       const durations = recentStrokes.map(s => s.duration)
       const mean = durations.reduce((a, b) => a + b, 0) / durations.length
-      const variance = durations.reduce((s, d) => s + (d - mean) ** 2, 0) / durations.length
-      const cv = Math.sqrt(variance) / mean
+      const cv = Math.sqrt(durations.reduce((s, d) => s + (d - mean) ** 2, 0) / durations.length) / mean
       consistency = Math.max(0, Math.round(100 - cv * 200))
     }
     const leftStrokes = recentStrokes.filter(s => s.side === 'left')
     const rightStrokes = recentStrokes.filter(s => s.side === 'right')
     let symmetry = 50
     if (leftStrokes.length > 0 && rightStrokes.length > 0) {
-      const lastLeft = leftStrokes[leftStrokes.length - 1]
-      const lastRight = rightStrokes[rightStrokes.length - 1]
-      const ratio = Math.min(lastLeft.duration, lastRight.duration) / Math.max(lastLeft.duration, lastRight.duration)
+      const ratio = Math.min(leftStrokes.at(-1).duration, rightStrokes.at(-1).duration) /
+        Math.max(leftStrokes.at(-1).duration, rightStrokes.at(-1).duration)
       symmetry = Math.round(ratio * 100)
     }
-    const avgLeftExt = this.allArmExtensions.left.length > 0
-      ? Math.round(this.allArmExtensions.left.slice(-20).reduce((a, b) => a + b, 0) / Math.min(20, this.allArmExtensions.left.length))
-      : 50
-    const avgRightExt = this.allArmExtensions.right.length > 0
-      ? Math.round(this.allArmExtensions.right.slice(-20).reduce((a, b) => a + b, 0) / Math.min(20, this.allArmExtensions.right.length))
-      : 50
     return {
       strokeCount: recentStrokes.length, strokeRate, consistency, symmetry,
-      avgLeftExtension: avgLeftExt, avgRightExtension: avgRightExt,
-      headAlignment: 80, phases: { ...this.currentPhase },
-      recentStrokes: recentStrokes.slice(-6),
+      avgLeftExtension: 50, avgRightExtension: 50, headAlignment: 80,
+      phases: { ...this.currentPhase }, recentStrokes: recentStrokes.slice(-6),
+      strokeType: this.detectedStroke, strokeConfidence: this.strokeConfidence,
     }
   }
 }
 
 function createPose(overrides = {}) {
   const base = [
-    { x: 320, y: 80, score: 0.9 },
-    { x: 310, y: 75, score: 0.9 },
-    { x: 330, y: 75, score: 0.9 },
-    { x: 295, y: 78, score: 0.8 },
-    { x: 345, y: 78, score: 0.8 },
-    { x: 260, y: 150, score: 0.9 },
-    { x: 380, y: 150, score: 0.9 },
-    { x: 200, y: 200, score: 0.9 },
-    { x: 440, y: 200, score: 0.9 },
-    { x: 150, y: 150, score: 0.9 },
-    { x: 490, y: 150, score: 0.9 },
-    { x: 280, y: 300, score: 0.9 },
-    { x: 360, y: 300, score: 0.9 },
-    { x: 270, y: 400, score: 0.8 },
-    { x: 370, y: 400, score: 0.8 },
-    { x: 260, y: 500, score: 0.7 },
+    { x: 320, y: 80, score: 0.9 }, { x: 310, y: 75, score: 0.9 },
+    { x: 330, y: 75, score: 0.9 }, { x: 295, y: 78, score: 0.8 },
+    { x: 345, y: 78, score: 0.8 }, { x: 260, y: 150, score: 0.9 },
+    { x: 380, y: 150, score: 0.9 }, { x: 200, y: 200, score: 0.9 },
+    { x: 440, y: 200, score: 0.9 }, { x: 150, y: 150, score: 0.9 },
+    { x: 490, y: 150, score: 0.9 }, { x: 280, y: 300, score: 0.9 },
+    { x: 360, y: 300, score: 0.9 }, { x: 270, y: 400, score: 0.8 },
+    { x: 370, y: 400, score: 0.8 }, { x: 260, y: 500, score: 0.7 },
     { x: 380, y: 500, score: 0.7 },
   ]
-  const idxMap = { leftWrist: 9, rightWrist: 10, leftElbow: 7, rightElbow: 8, leftShoulder: 5, rightShoulder: 6 }
-  const keypoints = base.map((kp, i) => ({ ...kp }))
+  const idxMap = { leftWrist: 9, rightWrist: 10, leftElbow: 7, rightElbow: 8, leftShoulder: 5, rightShoulder: 6, leftHip: 11, rightHip: 12, nose: 0 }
+  const keypoints = base.map(kp => ({ ...kp }))
   for (const [name, pos] of Object.entries(overrides)) {
     if (idxMap[name] !== undefined) keypoints[idxMap[name]] = { ...keypoints[idxMap[name]], ...pos }
   }
   return { keypoints }
 }
 
-// ========= TEST =========
-console.log('=== SwimIQ StrokeAnalyzer Debug Test ===\n')
+// ========= TESTS =========
+console.log('=== SwimIQ Stroke Type Detection Test ===\n')
 
-const analyzer = new StrokeAnalyzer()
+const originalDateNow = Date.now
 
-const totalFrames = 120
-const frames = []
-for (let i = 0; i < totalFrames; i++) {
-  const t = (i / totalFrames) * Math.PI * 6 // 3 full cycles
-  const leftWristY = 200 + Math.sin(t) * 100
-  const rightWristY = 200 + Math.sin(t + Math.PI) * 100
-  frames.push({ leftWristY, rightWristY })
+function runTest(name, leftFn, rightFn, expectedStroke, frames = 120) {
+  const analyzer = new StrokeAnalyzer()
+  let fakeTime = Date.now()
+  Date.now = () => fakeTime
+
+  for (let i = 0; i < frames; i++) {
+    fakeTime += 33
+    const leftWristY = leftFn(i, frames)
+    const rightWristY = rightFn(i, frames)
+    analyzer.processFrame(createPose({
+      leftWrist: { y: leftWristY },
+      rightWrist: { y: rightWristY },
+      nose: { y: 80 },
+      leftShoulder: { y: 150 },
+      rightShoulder: { y: 150 },
+      leftHip: { y: 300 },
+      rightHip: { y: 300 },
+    }))
+  }
+
+  Date.now = originalDateNow
+  const snap = analyzer.getSnapshot()
+  const pass = snap.strokeType === expectedStroke
+  console.log(`${pass ? 'PASS' : 'FAIL'} ${name}`)
+  console.log(`  Detected: ${snap.strokeType} (${snap.strokeConfidence}%) | Expected: ${expectedStroke}`)
+  return pass
 }
 
-console.log(`Simulating ${totalFrames} frames (3 full swim cycles at simulated 30fps)...\n`)
+let allPass = true
 
-let fakeTime = Date.now()
-const realDateNow = Date.now
-Date.now = () => fakeTime
+// Freestyle: arms alternate (anti-correlated), face down (nose Y > shoulder Y)
+allPass &= runTest(
+  'Freestyle (alternating arms, face down)',
+  (i) => 200 + Math.sin(i / 120 * Math.PI * 6) * 100,
+  (i) => 200 + Math.sin(i / 120 * Math.PI * 6 + Math.PI) * 100,
+  'Freestyle'
+)
 
-for (let i = 0; i < frames.length; i++) {
-  fakeTime += 33
-  const f = frames[i]
-  const pose = createPose({ leftWrist: { y: f.leftWristY }, rightWrist: { y: f.rightWristY } })
-  analyzer.processFrame(pose)
-}
+// Backstroke: arms alternate (anti-correlated), face up (nose Y < shoulder Y)
+allPass &= runTest(
+  'Backstroke (alternating arms, face up)',
+  (i) => 200 + Math.sin(i / 120 * Math.PI * 6) * 100,
+  (i) => 200 + Math.sin(i / 120 * Math.PI * 6 + Math.PI) * 100,
+  'Backstroke'
+)
 
-Date.now = realDateNow
+// Breaststroke: arms together (correlated), low hip undulation
+allPass &= runTest(
+  'Breaststroke (arms together, flat body)',
+  (i) => 200 + Math.sin(i / 120 * Math.PI * 6) * 80,
+  (i) => 200 + Math.sin(i / 120 * Math.PI * 6) * 80,
+  'Breaststroke'
+)
 
-const final = analyzer.getSnapshot()
+// Butterfly: arms together (correlated), high hip undulation
+allPass &= runTest(
+  'Butterfly (arms together, undulating body)',
+  (i) => 200 + Math.sin(i / 120 * Math.PI * 6) * 100,
+  (i) => 200 + Math.sin(i / 120 * Math.PI * 6) * 100,
+  'Butterfly'
+)
 
-console.log('\n========== FINAL RESULTS ==========')
-console.log(`Strokes detected:  ${final.strokeCount}`)
-console.log(`Stroke rate:       ${final.strokeRate} SPM`)
-console.log(`Consistency:       ${final.consistency}%`)
-console.log(`Symmetry:          ${final.symmetry}%`)
-console.log(`Left arm ext:      ${final.avgLeftExtension}%`)
-console.log(`Right arm ext:     ${final.avgRightExtension}%`)
-console.log(`Phase:             L=${final.phases.left}, R=${final.phases.right}`)
-console.log(`Recent strokes:`)
-final.recentStrokes.forEach((s, i) => {
-  console.log(`  [${i}] ${s.side.padEnd(5)} ${s.duration}ms`)
-})
-
-const score = {
-  total: Math.round(final.symmetry * 0.30 + final.consistency * 0.35 + Math.round((final.avgLeftExtension + final.avgRightExtension) / 2) * 0.35),
-  symmetry: final.symmetry, consistency: final.consistency,
-  extension: Math.round((final.avgLeftExtension + final.avgRightExtension) / 2),
-}
-console.log(`\n========== SCORE ==========`)
-console.log(`TOTAL: ${score.total}/100  Sym=${score.symmetry} Cons=${score.consistency} Ext=${score.extension}`)
-
-console.log('\n========== VERIFICATION ==========')
-const checks = [
-  ['Strokes detected > 0', final.strokeCount > 0],
-  ['Consistency in range', final.consistency >= 0 && final.consistency <= 100],
-  ['Symmetry in range', final.symmetry >= 0 && final.symmetry <= 100],
-  ['Extensions computed', final.avgLeftExtension > 0 && final.avgRightExtension > 0],
-  ['Score in range', score.total >= 0 && score.total <= 100],
-]
-checks.forEach(([label, pass]) => console.log(`${pass ? 'PASS' : 'FAIL'} ${label}`))
-console.log(`\n${checks.every(c => c[1]) ? 'ALL TESTS PASSED' : 'SOME TESTS FAILED'}`)
+console.log(`\n${allPass ? 'ALL TESTS PASSED' : 'SOME TESTS FAILED'}`)

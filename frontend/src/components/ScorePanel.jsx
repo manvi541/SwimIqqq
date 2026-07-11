@@ -17,6 +17,34 @@ function MetricBar({ label, value, color = 'from-cyan-500 to-blue-400' }) {
   )
 }
 
+function StrokeTypeBadge({ type, confidence }) {
+  const colors = {
+    Freestyle: 'bg-blue-500/20 border-blue-500/40 text-blue-300',
+    Backstroke: 'bg-purple-500/20 border-purple-500/40 text-purple-300',
+    Breaststroke: 'bg-emerald-500/20 border-emerald-500/40 text-emerald-300',
+    Butterfly: 'bg-amber-500/20 border-amber-500/40 text-amber-300',
+    'Detecting...': 'bg-slate-500/20 border-slate-500/40 text-slate-400',
+  }
+
+  const icons = {
+    Freestyle: '🏊',
+    Backstroke: '🔄',
+    Breaststroke: '🐸',
+    Butterfly: '🦋',
+    'Detecting...': '🔍',
+  }
+
+  return (
+    <div className={`rounded-xl border px-4 py-3 text-center ${colors[type] || colors['Detecting...']}`}>
+      <div className="text-2xl mb-1">{icons[type] || '🔍'}</div>
+      <div className="font-bold text-lg">{type}</div>
+      {type !== 'Detecting...' && (
+        <div className="text-xs opacity-70 mt-0.5">{confidence}% confidence</div>
+      )}
+    </div>
+  )
+}
+
 export default function ScorePanel({ score, snapshot }) {
   if (!score) {
     return (
@@ -31,6 +59,13 @@ export default function ScorePanel({ score, snapshot }) {
 
   return (
     <div className="bg-slate-900/50 backdrop-blur-sm border border-slate-700/50 rounded-2xl p-6 space-y-5 animate-slide-up">
+      {snapshot && (
+        <StrokeTypeBadge
+          type={snapshot.strokeType}
+          confidence={snapshot.strokeConfidence}
+        />
+      )}
+
       <div className="text-center">
         <div className={`text-6xl font-black ${getScoreColor(score.total)} animate-score-in`}>
           {score.total}
@@ -89,5 +124,3 @@ export default function ScorePanel({ score, snapshot }) {
     </div>
   )
 }
-
-
